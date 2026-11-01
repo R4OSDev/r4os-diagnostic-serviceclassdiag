@@ -102,14 +102,20 @@ fn holdService(ctx: *const r4os.r4sys.Context, stall_endpoint: bool) i32 {
     }
     while (!ctx.programShouldClose()) {
         if (handle != 0 and !stall_endpoint) {
-            const poll = ctx.serviceEndpointPoll(handle);
-            if (poll < 0) return poll;
-            if (poll > 0) {
+            // This ordinary echo/status endpoint has no periodic work. Keep
+            // the existing bounded Stop check while requests wake it directly.
+            const pending = ctx.serviceEndpointWait(handle, ctx.ticksFromMilliseconds(200));
+            if (pending < 0) {
+                if (ctx.programShouldClose()) break;
+                return pending;
+            }
+            if (pending > 0) {
                 const rc = handleServiceRequest(ctx, handle);
                 if (rc < 0) return rc;
             }
+        } else {
+            ctx.sleepTicks(1);
         }
-        ctx.sleepTicks(1);
     }
     if (handle != 0) _ = ctx.serviceEndpointUnregister(handle);
     return 0;
