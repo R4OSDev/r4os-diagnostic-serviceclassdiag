@@ -29,5 +29,10 @@ Contract:
   Terminal gestartet.
 - Seit 0.59.7 stellt `/STALLENDPOINT` den absichtlich nicht pollenden
   `SVCSTALL`-Endpoint fuer die dedizierte QEMU-Kill-waehrend-`io_wait`-
-  Regression bereit. Der Modus wird nur als gebundener Auto-Service aus dem
+  Regression bereit. Der Modus wird als gezielter Testdienst aus dem
   Test-Harness gestartet und beantwortet keine Requests.
+
+Generation2 seit0.90.81 / Modul 0.1.6:
+Echter App2-Einstieg und R4XStart2:2, ausschliesslich Query2:2-Imports.
+Gemeinsame SDK-Fachhelfer und genaue Fehler-/Frist-/Besitzergrenzen stehen
+in README.md; die urspruenglichen unabhaengigen Fachorakel bleiben erhalten.

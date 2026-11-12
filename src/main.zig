@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const self_path = "C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG\\SVCAPPD.R4X";
@@ -9,22 +10,24 @@ const stall_endpoint_arg = "/STALLENDPOINT";
 const apitest_arg = "/APITEST";
 const exit_arg = "/EXIT";
 const lifecycle_timeout_ms: u64 = 10_000;
-const inventory_restart_limit: u32 = 16;
-const inventory_would_block_retry_limit: u32 = 64;
 const op_echo: u16 = 1;
 const op_status: u16 = 2;
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     var ctx = r4_app.system();
-    if (argU32After(ctx.argsRaw(), exit_arg)) |exit_code| {
+    const options = parseOptions(r4_app) catch {
+        ctx.println("SVCAPPD invalid arguments");
+        return 2;
+    };
+    if (options.exit_code) |exit_code| {
         ctx.write("SVCAPPD lifecycle exit=");
         ctx.printU64(exit_code);
         ctx.println("");
         return @intCast(exit_code);
     }
-    if (hasArg(ctx.argsRaw(), stall_endpoint_arg)) return holdService(&ctx, true);
-    if (hasArg(ctx.argsRaw(), hold_arg)) return holdService(&ctx, false);
-    if (hasArg(ctx.argsRaw(), apitest_arg)) return runServiceApiTest(&ctx);
+    if (options.stall) return holdService(r4_app, &ctx, true, true);
+    if (options.hold) return holdService(r4_app, &ctx, false, options.endpoint);
+    if (options.apitest) return runServiceApiTest(r4_app, &ctx);
 
     ctx.println("SVCAPPD");
     var ok = true;
@@ -45,8 +48,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         ctx.println("");
         ok = false;
     } else {
-        const id = child.instance_id;
-        if (!waitServiceInstance(&ctx, id, 100)) {
+        if (!waitServiceInstance(r4_app, child, 100)) {
             ctx.println("SVCAPPD service instance not visible");
             ok = false;
         }
@@ -66,7 +68,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
             ctx.println("SVCAPPD completion wait/reap failed");
             ok = false;
         }
-        if (!waitInstanceGone(&ctx, id, 100)) {
+        if (!waitInstanceGone(r4_app, child, 100)) {
             ctx.println("SVCAPPD service instance still active");
             ok = false;
         }
@@ -77,67 +79,62 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     return if (ok) 0 else 1;
 }
 
-fn holdService(ctx: *const r4os.r4sys.Context, stall_endpoint: bool) i32 {
-    const endpoint_enabled = stall_endpoint or hasArg(ctx.argsRaw(), endpoint_arg);
-    const endpoint_name: [*:0]const u8 = if (stall_endpoint) stall_service_name else service_name;
-    var handle: u32 = 0;
+fn holdService(app: *r4os.App2, ctx: *const r4os.r4sys.Context, stall_endpoint: bool, endpoint_enabled: bool) i32 {
+    var endpoint: ?r4os.app_services.ServiceEndpoint = null;
+    defer if (endpoint) |*value| {
+        _ = value.unregister();
+    };
     if (endpoint_enabled) {
-        var info: r4os.abi.ServiceInfo = .{};
-        var tick: u32 = 0;
-        while (tick < 100 and handle == 0) : (tick += 1) {
-            const rc = ctx.serviceEndpointRegister(endpoint_name, 0, &info);
-            if (rc == r4os.abi.service_api_result_ok and info.handle != 0) {
-                handle = info.handle;
-                ctx.write(if (stall_endpoint) "SVCAPPD stall endpoint handle=" else "SVCAPPD endpoint handle=");
-                ctx.printU64(@intCast(handle));
-                ctx.println("");
-                break;
-            }
-            ctx.sleepTicks(1);
-        }
-        if (handle == 0) {
-            ctx.println("SVCAPPD endpoint registration failed");
-            return 2;
-        }
+        const services = app.services() orelse return 2;
+        const clock = app.clock() catch return 2;
+        var budget = r4os.rpc_budget.Budget.fromTicks(clock.read, 100) catch return 2;
+        endpoint = switch (r4os.app_services.registerUntil(&services, if (stall_endpoint) stall_service_name else service_name, 0, &budget)) {
+            .endpoint => |value| value,
+            .failure => {
+                ctx.println("SVCAPPD endpoint registration failed");
+                return 2;
+            },
+        };
+        ctx.write(if (stall_endpoint) "SVCAPPD stall endpoint handle=" else "SVCAPPD endpoint handle=");
+        ctx.printU64(endpoint.?.raw);
+        ctx.println("");
     }
-    while (!ctx.programShouldClose()) {
-        if (handle != 0 and !stall_endpoint) {
-            // This ordinary echo/status endpoint has no periodic work. Keep
-            // the existing bounded Stop check while requests wake it directly.
-            const pending = ctx.serviceEndpointWait(handle, ctx.ticksFromMilliseconds(200));
-            if (pending < 0) {
-                if (ctx.programShouldClose()) break;
-                return pending;
+    while (!app.shouldClose()) {
+        if (!stall_endpoint) {
+            if (endpoint) |*value| {
+                switch (value.wait(.{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = 200_000_000 })) {
+                    .timed_out => {},
+                    .failure => |code| {
+                        if (app.shouldClose()) break;
+                        return code;
+                    },
+                    .ready => {
+                        const rc = handleServiceRequest(value);
+                        if (rc < 0) return rc;
+                    },
+                }
+                continue;
             }
-            if (pending > 0) {
-                const rc = handleServiceRequest(ctx, handle);
-                if (rc < 0) return rc;
-            }
-        } else {
-            ctx.sleepTicks(1);
         }
+        // The deliberate STALL fixture must never receive or reply.
+        ctx.sleepTicks(1);
     }
-    if (handle != 0) _ = ctx.serviceEndpointUnregister(handle);
     return 0;
 }
 
-fn handleServiceRequest(ctx: *const r4os.r4sys.Context, handle: u32) i32 {
-    var header: r4os.abi.ServiceMessageHeader = .{};
+fn handleServiceRequest(endpoint: *r4os.app_services.ServiceEndpoint) i32 {
     var payload: [r4os.abi.service_api_max_payload]u8 = undefined;
-    const got = ctx.serviceEndpointRecv(handle, &header, payload[0..]);
-    if (got < 0) return got;
-    if (got == 0 and header.magic != r4os.abi.service_api_magic) return 0;
-    const payload_len: usize = @intCast(got);
-    if (header.op == op_echo) {
-        return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_ok, payload[0..payload_len]);
-    }
-    if (header.op == op_status) {
-        return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_ok, "OK");
-    }
-    return ctx.serviceEndpointReply(handle, header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
+    const message = switch (endpoint.recv(&payload)) {
+        .message => |value| value,
+        .would_block => return 0,
+        .failure => |code| return code,
+    };
+    if (message.header.op == op_echo) return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_ok, payload[0..message.bytes]);
+    if (message.header.op == op_status) return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_ok, "OK");
+    return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
 }
 
-fn runServiceApiTest(ctx: *const r4os.r4sys.Context) i32 {
+fn runServiceApiTest(app: *r4os.App2, ctx: *const r4os.r4sys.Context) i32 {
     ctx.println("SVCAPPD service api");
     var ok = true;
     if (!ctx.hasFn("service_call")) {
@@ -145,12 +142,19 @@ fn runServiceApiTest(ctx: *const r4os.r4sys.Context) i32 {
         ok = false;
     }
 
-    var info: r4os.abi.ServiceInfo = .{};
-    const handle = waitServiceOpen(ctx, &info, 100) orelse blk: {
-        ctx.println("SVCAPPD service api open failed");
-        ok = false;
-        break :blk 0;
+    const services = app.services() orelse return 1;
+    const clock = app.clock() catch return 1;
+    var budget = r4os.rpc_budget.Budget.fromTicks(clock.read, 100) catch return 1;
+    var connection = switch (r4os.app_services.openUntil(&services, service_name, &budget)) {
+        .connection => |value| value,
+        .failure => {
+            ctx.println("SVCAPPD service api open failed");
+            return 1;
+        },
     };
+    defer _ = connection.close();
+    const info = connection.info;
+    const handle = connection.raw;
     if (handle != 0) {
         if (info.state != r4os.abi.service_state_running or (info.flags & r4os.abi.service_api_flag_endpoint) == 0) {
             ctx.println("SVCAPPD service api status invalid");
@@ -220,7 +224,6 @@ fn runServiceApiTest(ctx: *const r4os.r4sys.Context) i32 {
             ctx.println("SVCAPPD service api queue metrics failed");
             ok = false;
         }
-        _ = ctx.serviceClose(handle);
     }
 
     ctx.write("SVCAPPD service api result: ");
@@ -228,159 +231,104 @@ fn runServiceApiTest(ctx: *const r4os.r4sys.Context) i32 {
     return if (ok) 0 else 1;
 }
 
-fn waitServiceOpen(ctx: *const r4os.r4sys.Context, info: *r4os.abi.ServiceInfo, max_ticks: u32) ?u32 {
-    var tick: u32 = 0;
-    while (tick < max_ticks) : (tick += 1) {
-        const rc = ctx.serviceOpen(service_name, info);
-        if (rc == r4os.abi.service_api_result_ok and info.handle != 0) return info.handle;
-        ctx.sleepTicks(1);
-    }
-    const rc = ctx.serviceOpen(service_name, info);
-    if (rc == r4os.abi.service_api_result_ok and info.handle != 0) return info.handle;
-    return null;
-}
-
-fn waitServiceInstance(ctx: *const r4os.r4sys.Context, id: u32, max_ticks: u32) bool {
-    var tick: u32 = 0;
-    while (tick < max_ticks) : (tick += 1) {
-        if (serviceInstanceOk(ctx, id)) {
+fn waitServiceInstance(app: *r4os.App2, handle: r4os.abi.ProgramProcessHandle, max_ticks: u32) bool {
+    const ctx = app.system();
+    const clock = app.clock() catch return false;
+    var budget = r4os.rpc_budget.Budget.fromTicks(clock.read, max_ticks) catch return false;
+    while (!app.shouldClose()) {
+        var info: r4os.abi.ProgramInstanceInfo = .{};
+        if (inventoryProgram(app, handle, &info, &budget) == 1 and
+            info.task_id != 0 and info.role == @intFromEnum(r4os.abi.ProgramInstanceRole.background) and
+            info.app_class == @intFromEnum(r4os.abi.ProgramInstanceClass.service) and
+            info.state == @intFromEnum(r4os.abi.ProgramInstanceState.running) and info.window_id == -1 and
+            info.flags & r4os.abi.ProgramInstanceFlag.terminal_mode == 0)
+        {
             ctx.println("SVCAPPD instance role=background class=service hostless=ok");
             return true;
         }
+        _ = budget.remainingTicks() catch return false;
         ctx.sleepTicks(1);
-    }
-    if (serviceInstanceOk(ctx, id)) {
-        ctx.println("SVCAPPD instance role=background class=service hostless=ok");
-        return true;
     }
     return false;
 }
 
-fn serviceInstanceOk(ctx: *const r4os.r4sys.Context, id: u32) bool {
-    var info: r4os.abi.ProgramInstanceInfo = .{};
-    if (inventoryProgramById(ctx, id, &info) != 1) return false;
-    return info.task_id != 0 and
-        info.role == @intFromEnum(r4os.abi.ProgramInstanceRole.background) and
-        info.app_class == @intFromEnum(r4os.abi.ProgramInstanceClass.service) and
-        info.state == @intFromEnum(r4os.abi.ProgramInstanceState.running) and
-        info.window_id == -1 and
-        (info.flags & r4os.abi.ProgramInstanceFlag.terminal_mode) == 0;
-}
-
-fn waitInstanceGone(ctx: *const r4os.r4sys.Context, id: u32, max_ticks: u32) bool {
-    var tick: u32 = 0;
-    while (tick < max_ticks) : (tick += 1) {
-        if (!instanceExists(ctx, id)) return true;
+fn waitInstanceGone(app: *r4os.App2, handle: r4os.abi.ProgramProcessHandle, max_ticks: u32) bool {
+    const ctx = app.system();
+    const clock = app.clock() catch return false;
+    var budget = r4os.rpc_budget.Budget.fromTicks(clock.read, max_ticks) catch return false;
+    while (!app.shouldClose()) {
+        var info: r4os.abi.ProgramInstanceInfo = .{};
+        // Only a complete stable view can prove exact-generation absence.
+        if (inventoryProgram(app, handle, &info, &budget) == 0) return true;
+        _ = budget.remainingTicks() catch return false;
         ctx.sleepTicks(1);
     }
-    return !instanceExists(ctx, id);
+    return false;
 }
 
-fn instanceExists(ctx: *const r4os.r4sys.Context, id: u32) bool {
-    var info: r4os.abi.ProgramInstanceInfo = .{};
-    // An unavailable or continuously mutating snapshot must not be confused
-    // with a confirmed removal.
-    return inventoryProgramById(ctx, id, &info) != 0;
-}
-
-// 1 = found, 0 = stable snapshot confirms missing, -1 = unavailable/restart.
-fn inventoryProgramById(ctx: *const r4os.r4sys.Context, id: u32, out: *r4os.abi.ProgramInstanceInfo) i32 {
+fn inventoryProgram(app: *r4os.App2, handle: r4os.abi.ProgramProcessHandle, out: *r4os.abi.ProgramInstanceInfo, budget: *r4os.rpc_budget.Budget) i32 {
     out.* = .{};
-    var attempt: u32 = 0;
-    restart: while (attempt < inventory_restart_limit) : (attempt += 1) {
-        var cursor: r4os.abi.ProgramInventoryCursor = .{};
-        var summary: r4os.abi.ProgramInventorySummary = .{};
-        if (!beginProgramInventory(ctx, &cursor, &summary)) return -1;
+    const allocator = app.allocator() orelse return -1;
+    const provider = app.inventoryProvider(.full) catch return -1;
+    var clock = app.clock() catch return -1;
+    var capacity: u32 = 32;
+    grow: while (true) {
+        _ = budget.remainingTicks() catch return -1;
+        const storage = allocator.alloc(r4os.abi.ProgramInstanceSnapshot, capacity) catch return -1;
+        defer allocator.free(storage);
+        var reader = r4os.inventory_reader.Reader.initAbsolute(.full, .{ .address = @intFromPtr(storage.ptr), .length = std.mem.sliceAsBytes(storage).len }, capacity, r4os.abi.program_inventory_page_max, provider, budget.deadline) catch return -1;
+        defer budget.deadline = reader.deadline;
         while (true) {
-            var entries: [@as(usize, r4os.abi.program_inventory_page_max)]r4os.abi.ProgramInstanceSnapshot = undefined;
-            var page: r4os.abi.ProgramInventoryPageInfo = .{};
-            if (!readProgramInventoryPage(ctx, &cursor, entries[0..], &page)) return -1;
-            if (page.status == r4os.abi.program_inventory_status_restart) continue :restart;
-            if (page.returned > entries.len or page.snapshot_generation != cursor.snapshot_generation) return -1;
-            for (entries[0..@intCast(page.returned)]) |entry| {
-                if (entry.info.id == id) {
-                    out.* = entry.info;
+            const progress = reader.step(app.shouldClose(), r4os.inventory_reader.PlatformClock.sample, &clock) catch return -1;
+            switch (@as(r4os.inventory_reader.Status, @enumFromInt(progress.status))) {
+                .complete => {
+                    const match = reader.findExact(handle) catch return -1;
+                    if (match.disposition == @intFromEnum(r4os.inventory_reader.Disposition.missing)) return 0;
+                    if (match.disposition != @intFromEnum(r4os.inventory_reader.Disposition.found)) return -1;
+                    out.* = (reader.fullView() catch return -1)[match.index].info;
                     return 1;
-                }
+                },
+                .initial, .more => {},
+                .would_block => app.system().sleepTicks(1),
+                .restart => {
+                    _ = reader.restart() catch return -1;
+                },
+                .capacity => {
+                    capacity = @max(progress.total, std.math.mul(u32, capacity, 2) catch return -1);
+                    continue :grow;
+                },
+                else => return -1,
             }
-            if (page.status == r4os.abi.program_inventory_status_complete) return 0;
-            if (page.status != r4os.abi.program_inventory_status_more or page.returned == 0) return -1;
         }
     }
-    return -1;
 }
 
-fn beginProgramInventory(
-    ctx: *const r4os.r4sys.Context,
-    cursor: *r4os.abi.ProgramInventoryCursor,
-    summary: *r4os.abi.ProgramInventorySummary,
-) bool {
-    var retry: u32 = 0;
-    while (retry <= inventory_would_block_retry_limit) : (retry += 1) {
-        cursor.* = .{};
-        summary.* = .{};
-        const status = ctx.programInventoryBegin(cursor, summary);
-        if (status == r4os.abi.program_handle_ok) return true;
-        if (status != r4os.abi.program_handle_error_would_block or retry == inventory_would_block_retry_limit)
-            return false;
-        ctx.sleepTicks(1);
-    }
-    return false;
-}
-
-fn readProgramInventoryPage(
-    ctx: *const r4os.r4sys.Context,
-    cursor: *r4os.abi.ProgramInventoryCursor,
-    entries: []r4os.abi.ProgramInstanceSnapshot,
-    page: *r4os.abi.ProgramInventoryPageInfo,
-) bool {
-    var retry: u32 = 0;
-    while (retry <= inventory_would_block_retry_limit) : (retry += 1) {
-        const cursor_before = cursor.*;
-        page.* = .{};
-        const status = ctx.programInventoryPrograms(cursor, entries, page);
-        if (status == r4os.abi.program_handle_ok) return true;
-        cursor.* = cursor_before;
-        page.* = .{};
-        if (status != r4os.abi.program_handle_error_would_block or retry == inventory_would_block_retry_limit)
-            return false;
-        ctx.sleepTicks(1);
-    }
-    return false;
-}
-
-fn hasArg(args: [*:0]const u8, wanted: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < 256 and args[offset] != 0) {
-        while (offset < 256 and (args[offset] == ' ' or args[offset] == '\t')) : (offset += 1) {}
-        const start = offset;
-        while (offset < 256 and args[offset] != 0 and args[offset] != ' ' and args[offset] != '\t') : (offset += 1) {}
-        if (equalsIgnoreCase(args[start..offset], wanted)) return true;
-    }
-    return false;
-}
-
-fn argU32After(args: [*:0]const u8, wanted: []const u8) ?u32 {
-    var offset: usize = 0;
-    var matched = false;
-    while (offset < 256 and args[offset] != 0) {
-        while (offset < 256 and (args[offset] == ' ' or args[offset] == '\t')) : (offset += 1) {}
-        const start = offset;
-        while (offset < 256 and args[offset] != 0 and args[offset] != ' ' and args[offset] != '\t') : (offset += 1) {}
-        const token = args[start..offset];
-        if (matched) {
-            if (token.len == 0) return null;
-            var value: u64 = 0;
-            for (token) |ch| {
-                if (ch < '0' or ch > '9') return null;
-                value = value * 10 + (ch - '0');
-                if (value > 0x7FFF_FFFF) return null;
+const Options = struct { hold: bool = false, stall: bool = false, endpoint: bool = false, apitest: bool = false, exit_code: ?u32 = null };
+fn parseOptions(app: *r4os.App2) !Options {
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = try app.argCursor(.{ .quotes = 0, .max_bytes = 4096 }, &failure);
+    var result: Options = .{};
+    while (try cursor.next()) |token| {
+        const value = try token.bytes(app.args());
+        if (equalsIgnoreCase(value, hold_arg)) result.hold = true;
+        if (equalsIgnoreCase(value, stall_endpoint_arg)) result.stall = true;
+        if (equalsIgnoreCase(value, endpoint_arg)) result.endpoint = true;
+        if (equalsIgnoreCase(value, apitest_arg)) result.apitest = true;
+        if (equalsIgnoreCase(value, exit_arg)) {
+            const number = (try cursor.next()) orelse return error.InvalidExit;
+            const text = try number.bytes(app.args());
+            if (text.len == 0) return error.InvalidExit;
+            var n: u32 = 0;
+            for (text) |ch| {
+                if (ch < '0' or ch > '9') return error.InvalidExit;
+                n = try std.math.mul(u32, n, 10);
+                n = try std.math.add(u32, n, ch - '0');
+                if (n > std.math.maxInt(i32)) return error.InvalidExit;
             }
-            return @intCast(value);
+            if (result.exit_code == null) result.exit_code = n;
         }
-        matched = equalsIgnoreCase(token, wanted);
     }
-    return null;
+    return result;
 }
 
 fn bytesEq(a: []const u8, b: []const u8) bool {
